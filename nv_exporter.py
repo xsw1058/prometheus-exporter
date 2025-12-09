@@ -11,9 +11,12 @@
 # Imports
 # ----------------------------------------
 import argparse
+import base64
 import json
 import os
+import random
 import signal
+import string
 import sys
 import time
 import urllib3
@@ -65,6 +68,386 @@ def _login(ctrl_url, ctrl_user, ctrl_pass):
 # ----------------------------------------
 # Classes
 # ----------------------------------------
+
+
+class FederationJoinManager:
+    """联邦加入管理器 - 处理集群自动加入的所有逻辑"""
+    
+    def __init__(self, endpoint, ctrl_user, ctrl_pass):
+        """初始化管理器
+        
+        Args:
+            ctrl_url: Controller URL
+            ctrl_user: Controller 用户名
+            ctrl_pass: Controller 密码
+        """
+        self._endpoint = endpoint
+        self.ctrl_url = "https://" + endpoint
+        self.ctrl_user = ctrl_user
+        self.ctrl_pass = ctrl_pass
+        # self._url = "https://" + endpoint
+
+        # 配置参数（从环境变量加载）
+        self.enabled = False
+        self.paas_store_id = None
+        self.join_token = None
+        self.join_token_url = None
+        self.join_address = None
+        self.join_port = 443
+        self.joint_rest_server = None
+        self.joint_rest_port = None
+        self.max_retries = 10
+        self.initial_retry_delay = 10
+        self.max_retry_delay = 300
+        
+        # 运行时状态
+        self.retry_count = 0
+    
+    def load_config(self):
+        """从环境变量加载配置
+        
+        Returns:
+            bool: 配置是否启用
+        """
+        # 检查是否启用联邦加入功能
+        enable_str = os.environ.get(ENV_ENABLE_FED_JOIN, "false").lower()
+        self.enabled = enable_str in ["true", "1", "yes"]
+        
+        if not self.enabled:
+            return False
+        
+        # 加载必要参数
+        self.paas_store_id = os.environ.get(ENV_PAAS_STORE_ID)
+        self.join_token = os.environ.get(ENV_JOIN_TOKEN)
+        self.join_token_url = os.environ.get(ENV_JOIN_TOKEN_URL)
+        self.join_address = os.environ.get(ENV_JOIN_ADDRESS)
+        self.joint_rest_server = os.environ.get(ENV_JOINT_REST_SERVER)
+        
+        # 加载可选参数
+        port_str = os.environ.get(ENV_JOIN_PORT)
+        if port_str:
+            try:
+                self.join_port = int(port_str)
+            except ValueError:
+                print(f"Warning: Invalid MASTER_CLUSTER_PORT value: {port_str}, using default 443")
+                self.join_port = 443
+        
+        joint_port_str = os.environ.get(ENV_JOINT_REST_PORT)
+        if joint_port_str:
+            try:
+                self.joint_rest_port = int(joint_port_str)
+            except ValueError:
+                print(f"Warning: Invalid JOINT_REST_PORT value: {joint_port_str}")
+                self.joint_rest_port = None
+        
+        max_retries_str = os.environ.get(ENV_MAX_JOIN_RETRIES)
+        if max_retries_str:
+            try:
+                self.max_retries = int(max_retries_str)
+            except ValueError:
+                print(f"Warning: Invalid MAX_JOIN_RETRIES value: {max_retries_str}, using default 10")
+                self.max_retries = 10
+        
+        return True
+    
+    def _validate_config(self):
+        """验证配置完整性
+        
+        Returns:
+            tuple[bool, str]: (是否有效, 错误信息)
+        """
+        # 检查必要参数
+        if not self.paas_store_id:
+            return False, "PAAS_STORE_ID is required"
+        
+        # if not self.joint_rest_server:
+        #     return False, "JOINT_REST_SERVER is required"
+        
+        # if not self.joint_rest_port:
+        #     return False, "JOINT_REST_PORT is required"
+        
+        # 检查 token 来源（至少有一个）
+        if not self.join_token and not self.join_token_url:
+            return False, "Either JOIN_TOKEN or JOIN_TOKEN_URL must be provided"
+        
+        return True, ""
+    
+    def _generate_cluster_name(self):
+        """生成集群名称
+        
+        Returns:
+            str: PAAS_STORE_ID + 6位随机字符串
+        """
+        # 生成 6 位随机字符串（字母和数字）
+        random_suffix = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+        return f"{self.paas_store_id}-{random_suffix}"
+    
+    def _get_join_address(self):
+        """获取主集群地址
+        
+        Returns:
+            str: 主集群地址（直接提供或根据 PAAS_STORE_ID 拼接）
+        """
+        # 如果直接提供了地址，优先使用
+        if self.join_address:
+            return self.join_address
+        
+        # 否则根据 PAAS_STORE_ID 拼接地址
+        return f"cn-wukong-r{self.paas_store_id}.mcd.store"
+    
+    def _fetch_join_token(self):
+        """获取 join token
+        
+        Returns:
+            tuple[bool, str]: (是否成功, token字符串)
+        """
+        # 如果直接提供了 token，使用它
+        if self.join_token:
+            print("Using join token from environment variable")
+            return True, self.join_token
+        
+        # 如果提供了 URL，从 URL 获取
+        if self.join_token_url:
+            print(f"Fetching join token from URL: {self.join_token_url}")
+            return self._fetch_token_from_url(self.join_token_url)
+        
+        # 不应该到达这里，因为 _validate_config 已经检查过
+        return False, ""
+    
+    def _fetch_token_from_url(self, url):
+        """从 URL 获取 token
+        
+        Args:
+            url: token URL
+            
+        Returns:
+            tuple[bool, str]: (是否成功, token字符串)
+        """
+        try:
+            response = requests.get(url, verify=False)
+            if response.status_code == 200:
+                response_json = json.loads(response.text)
+                join_token = response_json.get("context")
+                if join_token:
+                    print("Successfully fetched join token from URL")
+                    return True, join_token
+                else:
+                    print("Error: 'context' field not found in response")
+                    return False, ""
+            else:
+                print(f"Error: Failed to fetch token, status code: {response.status_code}")
+                return False, ""
+        except requests.exceptions.RequestException as e:
+            print(f"Error: Network error while fetching token: {e}")
+            return False, ""
+        except json.JSONDecodeError as e:
+            print(f"Error: Failed to parse JSON response: {e}")
+            return False, ""
+    
+    def _parse_token(self, token):
+        """解析 token 内容（base64 解码）
+        
+        Args:
+            token: base64 编码的 token
+            
+        Returns:
+            dict: 包含 server 和 port 的字典，失败返回 None
+        """
+        try:
+            # Base64 解码
+            token_str = base64.b64decode(token).decode("utf-8")
+            # 解析 JSON
+            token_data = json.loads(token_str)
+            # 提取 server 和 port
+            server = token_data.get("s")
+            port = token_data.get("p")
+            if server and port:
+                return {"server": server, "port": port}
+            else:
+                print("Error: Token does not contain 's' or 'p' fields")
+                return None
+        except Exception as e:
+            print(f"Error: Failed to parse token: {e}")
+            return None
+    
+    def _build_join_request(self, join_token, cluster_name):
+        """构建加入请求体
+        
+        Args:
+            join_token: join token 字符串
+            cluster_name: 集群名称
+            
+        Returns:
+            dict: 请求体字典
+        """
+        request_body = {
+            "name": cluster_name,
+            "join_token": join_token,
+            "joint_rest_info": {
+                "server": self._get_join_address(),
+                "port": self.join_port
+            }
+        }
+        return request_body
+    
+    def _send_join_request(self, request_body):
+        """发送加入请求到主集群
+        
+        Args:
+            request_body: 请求体
+            
+        Returns:
+            tuple[bool, int, str]: (是否成功, 状态码, 响应消息)
+        """
+        # 获取主集群地址
+        # master_address = self._get_master_address()
+        # master_port = self.master_cluster_port
+        
+        # 构建完整的 URL
+        # url = f"https://{master_address}:{master_port}/v1/fed/join"
+        
+        print(f"Sending request body:{request_body}")
+        print(f"Sending ctrl_url: {self.ctrl_url}")
+        try:
+            response = SESSION.post(self.ctrl_url + "/v1/fed/join", data=json.dumps(request_body), verify=False)
+            status_code = response.status_code
+            
+            if status_code == 200:
+                print(f"Join request successful: {status_code}")
+                return True, status_code, "Success"
+            else:
+                try:
+                    message = json.loads(response.text).get("message", response.text)
+                except:
+                    message = response.text
+                print(f"Join request failed: {status_code} - {message}")
+                return False, status_code, message
+        except requests.exceptions.RequestException as e:
+            print(f"Network error during join request: {e}")
+            return False, 0, str(e)
+    
+    def _handle_error_response(self, status_code, message):
+        """根据错误类型决定处理策略
+        
+        Args:
+            status_code: HTTP 状态码
+            message: 错误消息
+            
+        Returns:
+            str: 处理策略 ('stop', 'reauth', 'retry')
+        """
+        # 400, 409 错误：停止重试
+        if status_code in [400, 409]:
+            print(f"Non-retryable error: {status_code} - {message}")
+            return 'stop'
+        
+        # 401 错误：重新认证
+        if status_code == 401:
+            print(f"Authentication failed, will re-login: {status_code} - {message}")
+            return 'reauth'
+        
+        # 500+ 错误或网络错误：重试
+        if status_code >= 500 or status_code == 0:
+            print(f"Retryable error: {status_code} - {message}")
+            return 'retry'
+        
+        # 其他未知错误，默认重试
+        print(f"Unknown error, will retry: {status_code} - {message}")
+        return 'retry'
+    
+    def _calculate_backoff_delay(self):
+        """计算指数退避延迟时间
+        
+        Returns:
+            int: 等待秒数
+        """
+        delay = self.initial_retry_delay * (2 ** self.retry_count)
+        return min(delay, self.max_retry_delay)
+    
+    def _reauth(self):
+        """重新认证到 Controller
+        
+        Returns:
+            bool: 认证是否成功
+        """
+        print("Re-authenticating to controller...")
+        result = _login(self.ctrl_url, self.ctrl_user, self.ctrl_pass)
+        return result == 0
+    
+    def execute_join(self):
+        """执行完整的加入流程（主入口方法）
+        
+        Returns:
+            bool: 是否成功加入
+        """
+        print("=" * 60)
+        print("Starting federation join process...")
+        print("=" * 60)
+        
+        # 验证配置
+        valid, error_msg = self._validate_config()
+        if not valid:
+            print(f"Configuration validation failed: {error_msg}")
+            print("Skipping federation join")
+            return False
+        
+        # 获取 join token
+        success, join_token = self._fetch_join_token()
+        if not success:
+            print("Failed to fetch join token")
+            print("Skipping federation join")
+            return False
+        
+        # 生成集群名称
+        cluster_name = self._generate_cluster_name()
+        
+        print(f"Cluster name: {cluster_name}")
+        # print(f"Joint REST info: {self.joint_rest_server}:{self.joint_rest_port}")
+        
+        # 构建请求体
+        request_body = self._build_join_request(join_token, cluster_name)
+        
+        # 发送请求（带重试）
+        self.retry_count = 0
+        while self.retry_count <= self.max_retries:
+            if self.retry_count > 0:
+                delay = self._calculate_backoff_delay()
+                print(f"Retry {self.retry_count}/{self.max_retries} after {delay} seconds...")
+                time.sleep(delay)
+            
+            # 发送加入请求
+            success, status_code, message = self._send_join_request(request_body)
+            
+            if success:
+                print("=" * 60)
+                print("Federation join completed successfully!")
+                print("=" * 60)
+                return True
+            
+            # 处理错误
+            strategy = self._handle_error_response(status_code, message)
+            
+            if strategy == 'stop':
+                print("Stopping retry due to non-retryable error")
+                break
+            elif strategy == 'reauth':
+                if self._reauth():
+                    print("Re-authentication successful, retrying...")
+                    # 不增加 retry_count，直接重试
+                    continue
+                else:
+                    print("Re-authentication failed, stopping")
+                    break
+            elif strategy == 'retry':
+                self.retry_count += 1
+                if self.retry_count > self.max_retries:
+                    print(f"Max retries ({self.max_retries}) reached")
+                    break
+        
+        print("=" * 60)
+        print("Federation join failed, but exporter will continue running")
+        print("=" * 60)
+        return False
 
 
 class NVApiCollector:
@@ -590,6 +973,30 @@ ENV_CTRL_PASSWORD = "CTRL_PASSWORD"
 ENV_EXPORTER_PORT = "EXPORTER_PORT"
 ENV_ENFORCER_STATS = "ENFORCER_STATS"
 
+# Federation join environment variables
+ENV_ENABLE_FED_JOIN = "ENABLE_FED_JOIN"
+ENV_PAAS_STORE_ID = "PAAS_STORE_ID"
+ENV_JOIN_TOKEN = "JOIN_TOKEN"
+ENV_JOIN_TOKEN_URL = "JOIN_TOKEN_URL"
+ENV_JOIN_ADDRESS = "JOIN_ADDRESS"
+ENV_JOIN_PORT = "JOIN_PORT"
+ENV_JOINT_REST_SERVER = "JOINT_REST_SERVER"
+ENV_JOINT_REST_PORT = "JOINT_REST_PORT"
+ENV_MAX_JOIN_RETRIES = "MAX_JOIN_RETRIES"
+# 设置测试环境变量
+os.environ["CTRL_API_SERVICE"] = "192.168.8.209:10443"
+os.environ["CTRL_USERNAME"] = "admin"
+os.environ["CTRL_PASSWORD"] = "Y3Lx1Ez3sq88oia3gG"
+os.environ["EXPORTER_PORT"] = "8068"
+os.environ["ENABLE_FED_JOIN"] = "true"
+os.environ["PAAS_STORE_ID"] = "u2204a"
+os.environ["JOIN_ADDRESS"] = "u2204a.xsw.com"
+# os.environ["JOIN_PORT"] = "10443"
+os.environ["JOIN_TOKEN_URL"] = "https://neuvector.xsw.com/join_token"
+# os.environ["JOINT_REST_SERVER"] = "192.168.8.209"
+# os.environ["JOINT_REST_PORT"] = "10443"
+# os.environ["JOIN_TOKEN"] = "eyJzIjoibmV1dmVjdG9yLXdrLXRlc3QubWNkY2hpbmEubmV0IiwicCI6NDQzLCJ0IjoiS2g5b3YvczhxRXJSMFVRU1ZERjRwdW1JRmFxZktycWxhajZyRTZvVzhEVFhYQWVYK1VhR01HS0pTNnN5Nmc9PSJ9"
+
 if __name__ == '__main__':
     PARSER = argparse.ArgumentParser(description='NeuVector command line.')
     PARSER.add_argument("-e", "--port", type=int, help="exporter port")
@@ -644,8 +1051,19 @@ if __name__ == '__main__':
     # Login and get token
     if _login("https://" + CTRL_SVC, CTRL_USER, CTRL_PASS) < 0:
         sys.exit(1)
+    # Federation join (if enabled)
+    try:
+        fed_manager = FederationJoinManager(CTRL_SVC, CTRL_USER, CTRL_PASS)
+        if fed_manager.load_config():
+            print("\nFederation join is enabled")
+            fed_manager.execute_join()
+        else:
+            print("\nFederation join is disabled")
+    except Exception as e:
+        print(f"\nFederation join failed with exception: {e}")
+        print("Continuing with normal exporter operation...")
 
-    print("Start exporter server ...")
+    print("\nStart exporter server ...")
     start_http_server(PORT)
 
     print("Register collector ...")
